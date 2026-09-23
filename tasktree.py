@@ -26,6 +26,22 @@ scope: open --(close_scope)--> closing --(子任务全部退出)--> closed。
 --------
 exception_group(t) 按任务创建序（父先于子，id 即创建序）聚合子树内全部
 failed 任务的业务异常，返回 ExceptionGroup；无则返回 None。
+
+监督策略（watch）
+----------------
+watch(scope, strategy=...) 在某个 scope 上安装一个监督观察者：
+
+* "all"    —— 全部成功：所有直接子任务成功才满足；
+* "first"  —— 首个成功：任意一个直接子任务成功即满足；
+* "quorum" —— 指定数量成功：count 个直接子任务成功即满足。
+
+判定严格按输入事件顺序：watch() 时成员集合（该 scope 的直接子任务）冻结，
+此后不允许再向该 scope spawn。每个成员记录结局（finish/fail）时：
+成功数达到需求 -> 满足结束；成功数 + 未决数 < 需求 -> 永不可能满足，以
+不满足结束。任一结束都会：scope 置 closing，取消全部未完成成员（沿子树
+传播，shield 仍只记 pending），等待每个成员退出（清理确认）后 scope 才
+closed，watcher 汇总才定稿。失败结局与取消结局分别记录；清理期间发生的
+业务失败照样进入 exception_group。
 """
 
 from __future__ import annotations
@@ -40,11 +56,15 @@ MAX_NAME_LEN = 64    # 任务名最大字符数
 
 __all__ = [
     "MAX_TASKS", "MAX_DEPTH", "MAX_NAME_LEN",
+    "STRATEGIES",
     "TaskTreeError", "UnknownTaskError", "ScopeClosedError",
     "FinishConflictError", "ShieldError", "TaskStateError",
-    "ResourceLimitError", "TaskCancelled",
-    "Receipt", "TaskRuntime",
+    "ResourceLimitError", "StrategyError", "TaskCancelled",
+    "Receipt", "Watcher", "TaskRuntime",
 ]
+
+# 监督策略名 -> 规范化小写形式（构造时允许大小写混用的余地不提供，仅接受这三个）
+STRATEGIES = ("all", "first", "quorum")
 
 
 # ---------------------------------------------------------------- 错误类型
@@ -77,6 +97,10 @@ class ResourceLimitError(TaskTreeError):
     """超出任务数/深度等接口上限。"""
 
 
+class StrategyError(TaskTreeError):
+    """监督策略参数非法，或 watch 的前置条件不满足。"""
+
+
 class TaskCancelled(Exception):
     """取消标记：取消不是业务异常。fail() 拒绝该类的实例。"""
 
@@ -97,6 +121,8 @@ class _Task:
     pending_cancels: int = 0
     cancel_delivered: bool = False
     scope_state: str = "open"          # open | closing | closed
+    watcher: "Optional[Watcher]" = None
+    outcome_seq: Optional[int] = None  # 结局首次落定的事件序号（用于事件序归并）
 
 
 @dataclass(frozen=True)
@@ -122,6 +148,56 @@ class Receipt:
     scope_state: Optional[str]
     pending: tuple[str, ...]
     new_task_id: Optional[int] = None
+
+
+@dataclass
+class Watcher:
+    """某个 scope 上的监督观察者（watch() 的公开状态）。
+
+    scope            安装 watcher 的 scope 属主任务 id
+    strategy         all | first | quorum
+    required         需要成功的成员数（all=成员总数，first=1，quorum=count）
+    members          成员冻结集：watch() 时该 scope 的直接子任务 id（创建序）
+    state            pending（未达结束条件）| satisfied | unsatisfied |
+                     aborted（scope 在结束条件达成前被手工 close_scope）
+    satisfied        便于直接取用的布尔结论；pending/aborted 时为 None
+    succeeded        记录成功结局的成员（按输入事件顺序）
+    failed           记录业务失败结局的成员（按输入事件顺序；
+                     含清理确认期间才失败的成员）
+    cancelled        记录取消结局的成员（按输入事件顺序）
+    cleanup_failures 清理期间（取消请求发出后）记录业务失败的成员
+    decided_seq      触发结束条件的事件序号；未定稿为 None
+    closed_seq       清理完成、scope closed、汇总定稿的事件序号
+    """
+    scope: int
+    strategy: str
+    required: int
+    members: tuple[int, ...]
+    state: str = "pending"
+    satisfied: Optional[bool] = None
+    succeeded: list[int] = field(default_factory=list)
+    failed: list[int] = field(default_factory=list)
+    cancelled: list[int] = field(default_factory=list)
+    cleanup_failures: list[int] = field(default_factory=list)
+    decided_seq: Optional[int] = None
+    closed_seq: Optional[int] = None
+
+    def as_dict(self) -> dict[str, Any]:
+        """公开快照（全部为可直接比较的内建类型，可用于断言）。"""
+        return {
+            "scope": self.scope,
+            "strategy": self.strategy,
+            "required": self.required,
+            "members": list(self.members),
+            "state": self.state,
+            "satisfied": self.satisfied,
+            "succeeded": list(self.succeeded),
+            "failed": list(self.failed),
+            "cancelled": list(self.cancelled),
+            "cleanup_failures": list(self.cleanup_failures),
+            "decided_seq": self.decided_seq,
+            "closed_seq": self.closed_seq,
+        }
 
 
 # ---------------------------------------------------------------- 校验
@@ -220,9 +296,85 @@ class TaskRuntime:
                 continue  # 已有结局的任务不再接受取消
             self._request_cancel(n, notes)
 
+    # ----------------------------------------------------- watcher 机制
+
+    @staticmethod
+    def _bucket_for(w: Watcher, kind: str) -> list[int]:
+        """结局类型 -> watcher 对应的记账列表。"""
+        return {
+            "finished": w.succeeded,
+            "failed": w.failed,
+            "cancelled": w.cancelled,
+        }[kind]
+
+    def _note_member_outcome(self, node: _Task, notes: list[str]) -> None:
+        """成员记录结局后，按输入事件顺序更新所属 scope 的 watcher。
+
+        成功数达到需求 -> 满足结束；成功数 + 未决数 < 需求 -> 不可能满足，
+        以不满足结束。两种结束都立即把 scope 置 closing 并取消全部未结束
+        后代，进入"等待清理确认"阶段（scope 在成员全部退出后才 closed）。
+        """
+        if node.parent is None:
+            return
+        owner = self._tasks[node.parent]
+        w = owner.watcher
+        if w is None or node.id not in w.members:
+            return
+        bucket = self._bucket_for(w, node.outcome_kind)
+        if node.id not in bucket:
+            bucket.append(node.id)
+        # 清理确认期间（scope 已在收尾）才记录的业务失败
+        if (node.outcome_kind == "failed" and owner.scope_state == "closing"
+                and node.id not in w.cleanup_failures):
+            w.cleanup_failures.append(node.id)
+        if w.state != "pending":
+            return
+        n_succ = len(w.succeeded)
+        n_settled = len(w.succeeded) + len(w.failed) + len(w.cancelled)
+        unresolved = len(w.members) - n_settled
+        if n_succ >= w.required:
+            self._decide_watcher(w, True, notes)
+        elif n_succ + unresolved < w.required:
+            self._decide_watcher(w, False, notes)
+
+    def _decide_watcher(self, w: Watcher, satisfied: bool,
+                        notes: list[str]) -> None:
+        owner = self._tasks[w.scope]
+        w.state = "satisfied" if satisfied else "unsatisfied"
+        w.satisfied = satisfied
+        w.decided_seq = self._seq + 1  # 当前事件的 Receipt 尚未编号
+        verdict = "satisfied" if satisfied else "cannot be satisfied"
+        notes.append(
+            f"watcher on scope of task#{w.scope} ({w.strategy}): end "
+            f"condition {verdict} after {len(w.succeeded)} success(es) "
+            f"(need {w.required}); cancelling unfinished members and "
+            f"awaiting cleanup confirmation")
+        if owner.scope_state == "open":
+            owner.scope_state = "closing"
+            before = len(notes)
+            self._cancel_nodes(self._subtree(owner.id)[1:], notes)
+            if len(notes) == before:
+                notes.append("no unfinished descendants")
+
+    def _finalize_watchers(self, notes: list[str]) -> None:
+        """清理确认：成员全部退出、scope closed 后，watcher 汇总才定稿。"""
+        for t in self._tasks.values():
+            w = t.watcher
+            if (w is None or w.closed_seq is not None
+                    or t.scope_state != "closed"):
+                continue
+            w.closed_seq = self._seq
+            notes.append(
+                f"watcher on scope of task#{w.scope} finalized as "
+                f"{w.state}: {len(w.succeeded)} succeeded, "
+                f"{len(w.failed)} failed, {len(w.cancelled)} cancelled "
+                f"(summary now settled)")
+
     def _receipt(self, op: str, task_id: Optional[int],
                  notes: list[str], new_task_id: Optional[int] = None) -> Receipt:
         self._seq += 1
+        # scope 在本事件中收敛为 closed -> watcher 清理确认完成，汇总定稿
+        self._finalize_watchers(notes)
         t = self._tasks.get(task_id) if task_id is not None else None
         r = Receipt(
             seq=self._seq, op=op, task_id=task_id, ok=True,
@@ -247,6 +399,11 @@ class TaskRuntime:
             raise ScopeClosedError(
                 f"task#{p.id} already recorded outcome "
                 f"({p.outcome_kind}); its scope no longer accepts spawn")
+        if p.watcher is not None:
+            raise ScopeClosedError(
+                f"scope of task#{p.id} has a watcher installed "
+                f"({p.watcher.strategy}); its member set was frozen at "
+                f"watch() time and no longer accepts spawn")
         if name is None:
             name = f"task-{self._next_id}"
         elif not isinstance(name, str):
@@ -300,13 +457,16 @@ class TaskRuntime:
         if t.cancel_delivered:
             t.outcome_kind = "cancelled"
             t.outcome_value = None
+            t.outcome_seq = self._seq + 1
             notes = [f"cancellation had been delivered to task#{t.id}; "
                      f"result {result!r} superseded by cancellation"]
         else:
             t.outcome_kind = "finished"
             t.outcome_value = result
+            t.outcome_seq = self._seq + 1
             notes = [f"task#{t.id} finished with {result!r}"]
         t.state = "draining"
+        self._note_member_outcome(t, notes)
         self._reap()
         return self._receipt("finish", t.id, notes)
 
@@ -335,11 +495,13 @@ class TaskRuntime:
                  f"{t.outcome_kind}"])
         t.outcome_kind = "failed"
         t.outcome_value = exc
+        t.outcome_seq = self._seq + 1
         notes = [f"task#{t.id} failed with {type(exc).__name__}: {exc}"]
         if t.cancel_delivered:
             notes.append("cancellation had been delivered; "
                          "business failure takes precedence")
         t.state = "draining"
+        self._note_member_outcome(t, notes)
         self._reap()
         return self._receipt("fail", t.id, notes)
 
@@ -411,6 +573,16 @@ class TaskRuntime:
             t.scope_state = "closing"
             notes = [f"scope of task#{t.id} closing: requesting "
                      f"cancellation of all unfinished descendants"]
+            # 监督结束条件达成前手工关闭：watcher 作废，不产生成功/失败结论
+            w = t.watcher
+            if w is not None and w.state == "pending":
+                w.state = "aborted"
+                w.satisfied = None
+                w.decided_seq = self._seq + 1
+                notes.append(
+                    f"watcher on scope of task#{t.id} aborted: scope was "
+                    f"closed manually before its {w.strategy} end "
+                    f"condition was reached")
             before = len(notes)
             self._cancel_nodes(self._subtree(t.id)[1:], notes)
             if len(notes) == before:
@@ -419,6 +591,93 @@ class TaskRuntime:
         if t.scope_state == "closed":
             notes.append(f"scope of task#{t.id} closed")
         return self._receipt("close_scope", t.id, notes)
+
+    # ----------------------------------------------------- 事件：watch
+
+    def watch(self, task_id: int = 0, strategy: str = "all",
+              count: Optional[int] = None) -> Receipt:
+        """在 task_id 的 scope 上安装监督观察者。
+
+        strategy: "all"（全部成功）/ "first"（首个成功）/
+                  "quorum"（count 个成功）。
+        成员 = watch() 时该 scope 的直接子任务，立即冻结，此后拒绝 spawn。
+        必须在 scope open、且尚未安装 watcher 时调用。
+        """
+        t = self._get(task_id)
+        if not isinstance(strategy, str):
+            raise StrategyError(
+                f"strategy must be a str, got {type(strategy).__name__}: "
+                f"{strategy!r}")
+        if strategy not in STRATEGIES:
+            raise StrategyError(
+                f"unknown strategy {strategy!r}; expected one of {STRATEGIES}")
+        if count is not None:
+            _require_int(count, "count")
+        if strategy == "quorum":
+            if count is None:
+                raise StrategyError(
+                    "strategy 'quorum' requires count=<int>")
+            if count < 1:
+                raise StrategyError(
+                    f"count must be >= 1 for quorum, got {count}")
+        elif count is not None:
+            raise StrategyError(
+                f"count is only valid with strategy 'quorum', "
+                f"got strategy={strategy!r} count={count}")
+        if t.scope_state != "open":
+            raise StrategyError(
+                f"scope of task#{t.id} is {t.scope_state}; "
+                f"watch() requires an open scope")
+        if t.watcher is not None:
+            raise StrategyError(
+                f"scope of task#{t.id} already has a watcher "
+                f"({t.watcher.strategy}); exactly one watcher per scope")
+        members = tuple(t.children)
+        if not members:
+            raise StrategyError(
+                f"scope of task#{t.id} has no child tasks at watch() time; "
+                f"spawn members before watching")
+        if t.id != 0 and t.outcome_kind is not None:
+            raise StrategyError(
+                f"task#{t.id} already recorded outcome ({t.outcome_kind}); "
+                f"cannot watch a scope whose owner has ended")
+        if strategy == "all":
+            required = len(members)
+        elif strategy == "first":
+            required = 1
+        else:
+            required = count
+            if count > len(members):
+                raise StrategyError(
+                    f"quorum count {count} exceeds number of members "
+                    f"{len(members)}; it could never succeed")
+        w = Watcher(scope=t.id, strategy=strategy, required=required,
+                    members=members)
+        t.watcher = w
+        notes = [
+            f"watcher installed on scope of task#{t.id}: strategy={strategy}, "
+            f"members={list(members)}, required successes={required}; "
+            f"member set frozen (spawn into this scope now rejected)"]
+        # 成员可能在 watch 前已有结局：统一按事件序补登记并做一次判定，
+        # 让"安装即满足/不满足"与运行中到达走同一处规则。
+        self._note_watch_install(w, notes)
+        self._reap()
+        return self._receipt("watch", t.id, notes)
+
+    def _note_watch_install(self, w: Watcher, notes: list[str]) -> None:
+        """watch() 时若成员已有结局（允许先 finish 部分成员再 watch），
+        按结局落定的事件顺序补登记并立即做一次结束判定。"""
+        settled = [self._tasks[m] for m in w.members
+                   if self._tasks[m].outcome_kind is not None]
+        settled.sort(key=lambda m: m.outcome_seq)
+        for m in settled:
+            self._bucket_for(w, m.outcome_kind).append(m.id)
+        n_succ = len(w.succeeded)
+        n_settled = len(w.succeeded) + len(w.failed) + len(w.cancelled)
+        unresolved = len(w.members) - n_settled
+        if n_succ >= w.required or n_succ + unresolved < w.required:
+            # 安装前 scope 一直 open、不可能已发起清理；结论恒按普通路径走
+            self._decide_watcher(w, n_succ >= w.required, notes)
 
     # ---------------------------------------------------------- 查询
 
@@ -440,6 +699,8 @@ class TaskRuntime:
                 "cancel_delivered": t.cancel_delivered,
                 "scope": t.scope_state,
                 "children": list(t.children),
+                "watcher": (t.watcher.as_dict()
+                            if t.watcher is not None else None),
             }
         return out
 
@@ -477,6 +738,19 @@ class TaskRuntime:
                     reasons.append(
                         f"scope of task#{n.id}: closing, waiting on "
                         f"child task(s) {open_children}")
+            w = n.watcher
+            if w is not None:
+                unresolved_members = [
+                    m for m in w.members
+                    if self._tasks[m].state != "exited"]
+                if unresolved_members:
+                    phase = ("awaiting cleanup confirmation"
+                             if n.scope_state == "closing"
+                             else "end condition pending")
+                    reasons.append(
+                        f"watcher on scope of task#{n.id} ({w.strategy}, "
+                        f"state={w.state}): {phase}; members not exited: "
+                        f"{unresolved_members}")
         return reasons
 
     def exception_group(self, task_id: int = 0) -> Optional[ExceptionGroup]:
@@ -498,6 +772,15 @@ class TaskRuntime:
 
     def is_closed(self, task_id: int = 0) -> bool:
         return self._get(task_id).scope_state == "closed"
+
+    def watcher_summary(self, task_id: int = 0) -> Optional[dict[str, Any]]:
+        """返回该 scope 上 watcher 的定稿/当前汇总；未安装返回 None。
+
+        state == "pending" 表示结束条件尚未达成；scope 清理确认完成后
+        closed_seq 被赋值，汇总（succeeded/failed/cancelled）才定稿。
+        """
+        t = self._get(task_id)
+        return t.watcher.as_dict() if t.watcher is not None else None
 
     def outcome(self, task_id: int) -> tuple[Optional[str], Any]:
         t = self._get(task_id)
