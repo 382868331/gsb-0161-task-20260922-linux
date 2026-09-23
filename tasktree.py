@@ -26,6 +26,22 @@ scope: open --(close_scope)--> closing --(子任务全部退出)--> closed。
 --------
 exception_group(t) 按任务创建序（父先于子，id 即创建序）聚合子树内全部
 failed 任务的业务异常，返回 ExceptionGroup；无则返回 None。
+
+成功策略（watch）
+----------------
+watch(scope_id, strategy=...) 对某 scope 的**直接子任务**（以创建时刻的
+快照为成员集，之后冻结）设定成功策略，按输入事件顺序判定：
+
+* "all"       全部成功：任一成员业务失败即永不可能达标；否则全部成员成功才达标。
+* "first"     首个成功：第一个 finished 结局出现即达标；全部成员终结且无成功则不可能。
+* "n_succeed" 指定数量成功：finished 数达到 need 即达标；
+              finished + 未完成 < need 时永不可能达标。
+
+达到结束条件后进入 cleaning：请求取消全部未完成成员的子树，等待全部成员
+退出（清理确认）后才生成汇总（done）。汇总中成功、失败、取消分别记录；
+失败再按发生时刻分为判定阶段失败与清理失败（清理期间成员以业务异常退出）。
+watch 进行中（watching/cleaning）禁止向该 scope spawn；同一 scope 同一时刻
+只允许一个进行中的 watch。
 """
 
 from __future__ import annotations
@@ -38,11 +54,14 @@ MAX_TASKS = 10_000   # 单棵运行时允许的最大任务数（含根）
 MAX_DEPTH = 128      # 任务树最大深度（根深度为 0）
 MAX_NAME_LEN = 64    # 任务名最大字符数
 
+WATCH_STRATEGIES = ("all", "first", "n_succeed")  # 支持的成功策略
+
 __all__ = [
-    "MAX_TASKS", "MAX_DEPTH", "MAX_NAME_LEN",
+    "MAX_TASKS", "MAX_DEPTH", "MAX_NAME_LEN", "WATCH_STRATEGIES",
     "TaskTreeError", "UnknownTaskError", "ScopeClosedError",
     "FinishConflictError", "ShieldError", "TaskStateError",
     "ResourceLimitError", "TaskCancelled",
+    "WatchError", "WatchStateError", "UnknownWatchError",
     "Receipt", "TaskRuntime",
 ]
 
@@ -81,6 +100,18 @@ class TaskCancelled(Exception):
     """取消标记：取消不是业务异常。fail() 拒绝该类的实例。"""
 
 
+class WatchError(TaskTreeError):
+    """成功策略（watch）相关错误的基类。"""
+
+
+class WatchStateError(WatchError):
+    """watch 状态不允许该操作（如重复布防、汇总未就绪、成员重叠）。"""
+
+
+class UnknownWatchError(WatchError, LookupError):
+    """引用了不存在的 watch_id。"""
+
+
 # ---------------------------------------------------------------- 数据结构
 
 @dataclass
@@ -93,10 +124,26 @@ class _Task:
     state: str = "active"              # active | draining | exited
     outcome_kind: Optional[str] = None  # finished | failed | cancelled
     outcome_value: Any = None
+    outcome_seq: Optional[int] = None   # 记录结局时的事件序号（事件顺序判定用）
     shield_depth: int = 0
     pending_cancels: int = 0
     cancel_delivered: bool = False
     scope_state: str = "open"          # open | closing | closed
+
+
+@dataclass
+class _Watch:
+    """一个成功策略布防。成员集在创建时冻结（scope 当时的直接子任务）。"""
+    id: int
+    scope_id: int
+    strategy: str                      # all | first | n_succeed
+    need: Optional[int]                # 仅 n_succeed
+    members: tuple[int, ...]           # 成员任务 id（创建序）
+    phase: str = "watching"            # watching | cleaning | done
+    trigger_seq: Optional[int] = None  # 达到结束条件的事件序号
+    goal_met: Optional[bool] = None    # 结束条件是否因达标而触发
+    done_seq: Optional[int] = None     # 汇总就绪的事件序号
+    result: Optional[dict] = None      # 汇总（见 watch_result）
 
 
 @dataclass(frozen=True)
@@ -107,11 +154,14 @@ class Receipt:
     op          操作名
     task_id     目标任务/scope 属主 id
     ok          事件是否被接受（语义拒绝会抛异常而不是返回 ok=False）
-    notes       该事件产生的说明（含 pending/late/idempotent 等细节）
+    notes       该事件产生的说明（含 pending/late/idempotent/watch 等细节）
     state       事件后目标任务状态（root 为 None）
     scope_state 事件后目标 scope 状态
     pending     事件后整棵树的待完成原因（pending_reasons(0)）
     new_task_id 仅 spawn：新任务 id
+    watch_id    仅 watch：新布防 id
+    watch_phase 仅 watch：布防在事件后的阶段（watching/cleaning/done）
+    watch_updates 本事件中发生阶段变迁的 watch：((watch_id, 新阶段), ...)
     """
     seq: int
     op: str
@@ -122,6 +172,9 @@ class Receipt:
     scope_state: Optional[str]
     pending: tuple[str, ...]
     new_task_id: Optional[int] = None
+    watch_id: Optional[int] = None
+    watch_phase: Optional[str] = None
+    watch_updates: tuple[tuple[int, str], ...] = ()
 
 
 # ---------------------------------------------------------------- 校验
@@ -160,6 +213,8 @@ class TaskRuntime:
             0: _Task(id=0, parent=None, name="<root>", depth=0)}
         self._next_id = 1
         self._seq = 0
+        self._watches: dict[int, _Watch] = {}
+        self._next_watch_id = 1
         self.log: list[Receipt] = []
 
     # ---------------------------------------------------------- 内部工具
@@ -170,6 +225,13 @@ class TaskRuntime:
             return self._tasks[task_id]
         except KeyError:
             raise UnknownTaskError(f"unknown task_id: {task_id}") from None
+
+    def _get_watch(self, watch_id: Any) -> _Watch:
+        _require_int(watch_id, "watch_id")
+        try:
+            return self._watches[watch_id]
+        except KeyError:
+            raise UnknownWatchError(f"unknown watch_id: {watch_id}") from None
 
     def _subtree(self, task_id: int) -> list[_Task]:
         """按创建序（父先于子）返回 task_id 及其全部后代。"""
@@ -221,9 +283,12 @@ class TaskRuntime:
             self._request_cancel(n, notes)
 
     def _receipt(self, op: str, task_id: Optional[int],
-                 notes: list[str], new_task_id: Optional[int] = None) -> Receipt:
+                 notes: list[str], new_task_id: Optional[int] = None,
+                 watch_id: Optional[int] = None,
+                 watch_updates: tuple[tuple[int, str], ...] = ()) -> Receipt:
         self._seq += 1
         t = self._tasks.get(task_id) if task_id is not None else None
+        w = self._watches.get(watch_id) if watch_id is not None else None
         r = Receipt(
             seq=self._seq, op=op, task_id=task_id, ok=True,
             notes=tuple(notes),
@@ -231,9 +296,149 @@ class TaskRuntime:
             scope_state=(t.scope_state if t is not None else None),
             pending=tuple(self.pending_reasons(0)),
             new_task_id=new_task_id,
+            watch_id=watch_id,
+            watch_phase=(w.phase if w is not None else None),
+            watch_updates=watch_updates,
         )
         self.log.append(r)
         return r
+
+    # ------------------------------------------------- watch 推进与汇总
+
+    def _pump_watches(self, notes: list[str],
+                      updates: list[tuple[int, str]] | None = None) -> None:
+        """每个被接受的事件后推进全部 watch（不动点收敛）。
+
+        顺序：判定 watching 是否达到结束条件 -> cleaning 中确认全部成员
+        退出后生成汇总。结局序号由 finish/fail 在记录结局时直接写入，
+        因此本方法只需做不动点推进。发生的阶段变迁（含同事件连续变迁）
+        记入 updates：(watch_id, 新阶段)。
+        """
+        changed = True
+        while changed:
+            changed = False
+            for w in sorted(self._watches.values(), key=lambda w: w.id):
+                if w.phase == "watching" and self._watch_end_condition(w):
+                    self._start_cleanup(w, notes)
+                    if updates is not None:
+                        updates.append((w.id, "cleaning"))
+                    changed = True
+                if w.phase == "cleaning" and all(
+                        self._tasks[m].state == "exited" for m in w.members):
+                    self._finalize_watch(w, notes)
+                    if updates is not None:
+                        updates.append((w.id, "done"))
+                    changed = True
+
+    def _watch_end_condition(self, w: _Watch) -> bool:
+        """按输入事件顺序判定是否达到结束条件（达标或永不可能达标）。
+
+        已被投递取消但尚未结局的成员注定无法 finished（取消后 finish 只能
+        得到 cancelled、fail 只能得到 failed），因此算作"不可能再成功"；
+        shield 内仅 pending 的取消不算（仍可正常 finish 后丢弃 pending）。
+        """
+        tasks = self._tasks
+        n_fin = n_fail = n_cancel = n_open = 0
+        n_possible = 0  # 未结局且取消未投递：仍可能 finished
+        for m in w.members:
+            kind = tasks[m].outcome_kind
+            if kind == "finished":
+                n_fin += 1
+            elif kind == "failed":
+                n_fail += 1
+            elif kind == "cancelled":
+                n_cancel += 1
+            else:
+                n_open += 1
+                if not tasks[m].cancel_delivered:
+                    n_possible += 1
+        if w.strategy == "all":
+            # 任一成员 failed/cancelled/已投递取消即注定无法全部成功
+            if n_fail > 0 or n_cancel > 0 or n_possible < n_open:
+                w.goal_met = False
+                return True
+            if n_open == 0:
+                w.goal_met = n_fin == len(w.members)
+                return True
+            return False
+        if w.strategy == "first":
+            if n_fin > 0:
+                w.goal_met = True
+                return True
+            if n_possible == 0:
+                w.goal_met = False
+                return True
+            return False
+        # n_succeed：failed/cancelled/已投递取消都不占成功名额
+        if n_fin >= w.need:
+            w.goal_met = True
+            return True
+        if n_fin + n_possible < w.need:
+            w.goal_met = False
+            return True
+        return False
+
+    def _start_cleanup(self, w: _Watch, notes: list[str]) -> None:
+        """达到结束条件：请求取消全部未完成成员的子树，进入清理等待。"""
+        w.phase = "cleaning"
+        w.trigger_seq = self._seq + 1
+        goal = "satisfied" if w.goal_met else "unsatisfiable"
+        notes.append(
+            f"watch#{w.id} ({w.strategy}) end condition met ({goal}); "
+            f"cancelling unfinished member subtrees and awaiting cleanup")
+        for m in w.members:
+            t = self._tasks[m]
+            if t.outcome_kind is None:
+                self._cancel_nodes(self._subtree(m), notes)
+
+    def _finalize_watch(self, w: _Watch, notes: list[str]) -> None:
+        """清理确认（全部成员退出）后生成汇总：成功/失败/取消分别记录。"""
+        w.phase = "done"
+        w.done_seq = self._seq + 1
+        recs = sorted(
+            (self._tasks[m] for m in w.members),
+            key=lambda t: (t.outcome_seq, t.id))
+        successes = [{"task_id": t.id, "name": t.name, "value": t.outcome_value}
+                     for t in recs if t.outcome_kind == "finished"]
+        # 失败按发生时刻分流：trigger_seq 之后记录的结局属于清理阶段
+        failures = [{"task_id": t.id, "name": t.name, "error": t.outcome_value,
+                     "phase": ("cleanup"
+                               if t.outcome_seq > w.trigger_seq
+                               else "trigger")}
+                    for t in recs if t.outcome_kind == "failed"]
+        cancelled = [t.id for t in recs if t.outcome_kind == "cancelled"]
+        cleanup_failures = [f for f in failures if f["phase"] == "cleanup"]
+        if w.goal_met:
+            status = ("satisfied_with_cleanup_errors"
+                      if cleanup_failures else "satisfied")
+        else:
+            status = "unsatisfiable"
+        if w.strategy == "all":
+            winners = ([s["task_id"] for s in successes]
+                       if status != "unsatisfiable" else [])
+        elif w.strategy == "first":
+            winners = ([successes[0]["task_id"]] if successes else [])
+        else:  # n_succeed
+            winners = [s["task_id"] for s in successes[:w.need]]
+        w.result = {
+            "watch_id": w.id,
+            "scope_id": w.scope_id,
+            "strategy": w.strategy,
+            "need": w.need,
+            "status": status,
+            "goal_met": w.goal_met,
+            "members": list(w.members),
+            "winners": winners,
+            "successes": successes,
+            "failures": failures,
+            "cancelled": cancelled,
+            "trigger_seq": w.trigger_seq,
+            "done_seq": w.done_seq,
+        }
+        notes.append(
+            f"watch#{w.id} cleanup confirmed; summary ready "
+            f"(status={status}, successes={len(successes)}, "
+            f"failures={len(failures)}, cancelled={len(cancelled)})")
 
     # ---------------------------------------------------------- 事件：spawn
 
@@ -247,6 +452,12 @@ class TaskRuntime:
             raise ScopeClosedError(
                 f"task#{p.id} already recorded outcome "
                 f"({p.outcome_kind}); its scope no longer accepts spawn")
+        for w in self._watches.values():
+            if w.scope_id == p.id and w.phase != "done":
+                raise WatchStateError(
+                    f"scope of task#{p.id} has active watch#{w.id} "
+                    f"({w.phase}); spawn is forbidden until the watch is "
+                    f"done (watch membership is frozen at creation)")
         if name is None:
             name = f"task-{self._next_id}"
         elif not isinstance(name, str):
@@ -307,8 +518,12 @@ class TaskRuntime:
             t.outcome_value = result
             notes = [f"task#{t.id} finished with {result!r}"]
         t.state = "draining"
+        t.outcome_seq = self._seq + 1  # 本事件序号（receipt 尚未编号）
         self._reap()
-        return self._receipt("finish", t.id, notes)
+        updates: list[tuple[int, str]] = []
+        self._pump_watches(notes, updates)
+        return self._receipt("finish", t.id, notes,
+                             watch_updates=tuple(updates))
 
     # ---------------------------------------------------------- 事件：fail
 
@@ -340,8 +555,12 @@ class TaskRuntime:
             notes.append("cancellation had been delivered; "
                          "business failure takes precedence")
         t.state = "draining"
+        t.outcome_seq = self._seq + 1  # 本事件序号（receipt 尚未编号）
         self._reap()
-        return self._receipt("fail", t.id, notes)
+        updates: list[tuple[int, str]] = []
+        self._pump_watches(notes, updates)
+        return self._receipt("fail", t.id, notes,
+                             watch_updates=tuple(updates))
 
     # ---------------------------------------------------------- 事件：cancel
 
@@ -358,7 +577,10 @@ class TaskRuntime:
                 f"task#{t.id} and its subtree already have recorded "
                 f"outcomes; nothing to cancel")
         self._reap()
-        return self._receipt("cancel", t.id, notes)
+        updates: list[tuple[int, str]] = []
+        self._pump_watches(notes, updates)
+        return self._receipt("cancel", t.id, notes,
+                             watch_updates=tuple(updates))
 
     # ------------------------------------------------- 事件：shield 进出
 
@@ -398,7 +620,10 @@ class TaskRuntime:
                     f"cancellation(s) discarded: task#{t.id} already ended "
                     f"as {t.outcome_kind}")
         self._reap()
-        return self._receipt("leave_shield", t.id, notes)
+        updates: list[tuple[int, str]] = []
+        self._pump_watches(notes, updates)
+        return self._receipt("leave_shield", t.id, notes,
+                             watch_updates=tuple(updates))
 
     # ------------------------------------------------- 事件：close_scope
 
@@ -416,16 +641,81 @@ class TaskRuntime:
             if len(notes) == before:
                 notes.append("no unfinished descendants")
         self._reap()
+        updates: list[tuple[int, str]] = []
+        self._pump_watches(notes, updates)
         if t.scope_state == "closed":
             notes.append(f"scope of task#{t.id} closed")
-        return self._receipt("close_scope", t.id, notes)
+        return self._receipt("close_scope", t.id, notes,
+                             watch_updates=tuple(updates))
+
+    # ------------------------------------------------- 事件：watch（成功策略）
+
+    def watch(self, scope_id: int = 0, strategy: str = "all",
+              need: Optional[int] = None) -> Receipt:
+        """对 scope 的直接子任务（创建时刻快照）布防成功策略。
+
+        strategy: "all" 全部成功 | "first" 首个成功 | "n_succeed" 指定数量
+        成功（需 need >= 1）。成员集在创建时冻结；布防进行中禁止向该 scope
+        spawn。判定按输入事件顺序进行，达到结束条件后取消未完成成员并等待
+        清理确认，汇总就绪后通过 watch_result(watch_id) 读取。
+        """
+        t = self._get(scope_id)
+        if not isinstance(strategy, str):
+            raise TypeError(
+                f"strategy must be a str, got {type(strategy).__name__}: "
+                f"{strategy!r}")
+        if strategy not in WATCH_STRATEGIES:
+            raise ValueError(
+                f"strategy must be one of {WATCH_STRATEGIES}, "
+                f"got {strategy!r}")
+        if strategy == "n_succeed":
+            if need is None:
+                raise ValueError(
+                    "need is required for strategy 'n_succeed' "
+                    "(int >= 1)")
+            _require_int(need, "need")
+            if need < 1:
+                raise ValueError(f"need must be >= 1, got {need}")
+        elif need is not None:
+            raise ValueError(
+                f"need is only valid for strategy 'n_succeed', "
+                f"got need={need!r} with strategy={strategy!r}")
+        if t.scope_state != "open":
+            raise WatchStateError(
+                f"scope of task#{t.id} is {t.scope_state}; "
+                f"cannot watch a closing/closed scope")
+        members = tuple(t.children)
+        for w in self._watches.values():
+            if w.phase != "done" and w.scope_id == t.id:
+                raise WatchStateError(
+                    f"scope of task#{t.id} already has active watch#{w.id} "
+                    f"({w.phase}); one active watch per scope")
+        wid = self._next_watch_id
+        self._next_watch_id += 1
+        w = _Watch(id=wid, scope_id=t.id, strategy=strategy, need=need,
+                   members=members)
+        self._watches[wid] = w
+        notes = [
+            f"watch#{wid} armed on scope of task#{t.id}: strategy="
+            f"{strategy!r}"
+            + (f", need={need}" if strategy == "n_succeed" else "")
+            + f", members={list(members)} (frozen at creation)"]
+        updates: list[tuple[int, str]] = []
+        self._pump_watches(notes, updates)  # 成员可能已终结，立即按事件序判定
+        return self._receipt("watch", t.id, notes, watch_id=wid,
+                             watch_updates=tuple(updates))
 
     # ---------------------------------------------------------- 查询
 
     def status(self) -> dict[int, dict[str, Any]]:
         """整棵树快照（按任务创建序）。"""
+        active_by_scope: dict[int, _Watch] = {}
+        for w in self._watches.values():
+            if w.phase != "done":
+                active_by_scope[w.scope_id] = w
         out: dict[int, dict[str, Any]] = {}
         for tid, t in sorted(self._tasks.items()):
+            w = active_by_scope.get(tid)
             out[tid] = {
                 "name": t.name,
                 "parent": t.parent,
@@ -435,11 +725,14 @@ class TaskRuntime:
                           if t.outcome_kind == "finished" else None),
                 "error": (repr(t.outcome_value)
                           if t.outcome_kind == "failed" else None),
+                "outcome_seq": t.outcome_seq,
                 "shield_depth": t.shield_depth,
                 "pending_cancels": t.pending_cancels,
                 "cancel_delivered": t.cancel_delivered,
                 "scope": t.scope_state,
                 "children": list(t.children),
+                "watch": (w.id if w is not None else None),
+                "watch_phase": (w.phase if w is not None else None),
             }
         return out
 
@@ -477,6 +770,21 @@ class TaskRuntime:
                     reasons.append(
                         f"scope of task#{n.id}: closing, waiting on "
                         f"child task(s) {open_children}")
+        for w in sorted(self._watches.values(), key=lambda w: w.id):
+            if w.phase == "done":
+                continue
+            if not any(n.id == w.scope_id for n in self._subtree(t.id)):
+                continue
+            if w.phase == "watching":
+                reasons.append(
+                    f"watch#{w.id} on scope of task#{w.scope_id}: watching "
+                    f"({w.strategy})")
+            else:
+                waiting = [m for m in w.members
+                           if self._tasks[m].state != "exited"]
+                reasons.append(
+                    f"watch#{w.id} on scope of task#{w.scope_id}: cleaning, "
+                    f"waiting on member task(s) {waiting}")
         return reasons
 
     def exception_group(self, task_id: int = 0) -> Optional[ExceptionGroup]:
@@ -502,3 +810,58 @@ class TaskRuntime:
     def outcome(self, task_id: int) -> tuple[Optional[str], Any]:
         t = self._get(task_id)
         return t.outcome_kind, t.outcome_value
+
+    # ------------------------------------------------- 查询：watch
+
+    def watch_result(self, watch_id: int) -> dict:
+        """读取 watch 汇总；仅在清理确认完成（done）后可用。
+
+        返回 dict 的键：
+        watch_id/scope_id/strategy/need  布防标识与参数
+        status     satisfied | satisfied_with_cleanup_errors | unsatisfiable
+        goal_met   结束条件是否因达标而触发
+        members    成员任务 id（创建序，创建时冻结）
+        winners    计入达标的成功任务 id（事件序）
+        successes  [{"task_id","name","value"}...]（事件序）
+        failures   [{"task_id","name","error","phase"}...]（事件序）；
+                   phase 为 "trigger"（判定阶段）或 "cleanup"（清理失败）
+        cancelled  被取消的成员任务 id（事件序）
+        trigger_seq/done_seq  触发与汇总就绪的事件序号
+        """
+        w = self._get_watch(watch_id)
+        if w.phase != "done":
+            raise WatchStateError(
+                f"watch#{w.id} is {w.phase}; summary is available only "
+                f"after cleanup is confirmed (phase 'done')")
+        # 重建一层容器，防止外部改到内部状态；结果值/异常对象保持身份
+        # （与库内不深拷贝 finish 结果的约定一致）。
+        r = w.result
+        return {
+            **r,
+            "members": list(r["members"]),
+            "winners": list(r["winners"]),
+            "cancelled": list(r["cancelled"]),
+            "successes": [dict(s) for s in r["successes"]],
+            "failures": [dict(f) for f in r["failures"]],
+        }
+
+    def watches(self) -> dict[int, dict[str, Any]]:
+        """全部 watch 的快照（按布防序）。"""
+        out: dict[int, dict[str, Any]] = {}
+        for wid, w in sorted(self._watches.items()):
+            kinds = [self._tasks[m].outcome_kind for m in w.members]
+            out[wid] = {
+                "scope_id": w.scope_id,
+                "strategy": w.strategy,
+                "need": w.need,
+                "members": list(w.members),
+                "phase": w.phase,
+                "goal_met": w.goal_met,
+                "trigger_seq": w.trigger_seq,
+                "done_seq": w.done_seq,
+                "finished": kinds.count("finished"),
+                "failed": kinds.count("failed"),
+                "cancelled": kinds.count("cancelled"),
+                "open": kinds.count(None),
+            }
+        return out
