@@ -26,10 +26,30 @@ scope: open --(close_scope)--> closing --(子任务全部退出)--> closed。
 --------
 exception_group(t) 按任务创建序（父先于子，id 即创建序）聚合子树内全部
 failed 任务的业务异常，返回 ExceptionGroup；无则返回 None。
+
+逻辑时钟与截止时间
+------------------
+* 运行时装维护一个非递减的整数逻辑时钟 now（初始 0），只能由
+  advance_time(now) 显式推进；时间为非递减整数，倒退被拒绝。
+* set_deadline(t, d) 给任务或 scope（含 root）设置截止时刻 d（整数，
+  不得小于当前时刻）；子任务不复制父任务的截止时间。
+* advance_time(T) 先按 (截止时刻, 任务创建序) 触发全部到期条目
+  （deadline <= T，恰好相等也算到期），再返回；调用方的下一条业务事件
+  因此在所有到期处理之后才被处理。
+* 到期只提出取消请求：等价于对该任务子树执行 cancel 的取消部分
+  （root 到期 = 请求取消全部未结束后代），shield 内仍只记 pending，
+  scope 的关闭仍必须走 close_scope 的既有等待条件，到期不绕过它。
+* 任务记录结局（finish/fail）或其 scope closed 后，到期记录立即失效；
+  更新截止时间会使旧定时条目作废（按代次惰性剔除），旧条目不得影响
+  同一任务的新一代定时。
+* 到期引发的取消仍是取消：cancelled 不进入 exception_group，超时不被
+  记成业务异常。
+* next_deadline() 返回 (下一到期时刻, task_id) 供模拟器逐步驱动。
 """
 
 from __future__ import annotations
 
+import heapq
 import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -97,6 +117,8 @@ class _Task:
     pending_cancels: int = 0
     cancel_delivered: bool = False
     scope_state: str = "open"          # open | closing | closed
+    deadline: Optional[int] = None     # 截止时刻（逻辑时钟）；None = 无
+    deadline_gen: int = 0              # 定时条目代次：更新/失效时递增
 
 
 @dataclass(frozen=True)
@@ -112,6 +134,7 @@ class Receipt:
     scope_state 事件后目标 scope 状态
     pending     事件后整棵树的待完成原因（pending_reasons(0)）
     new_task_id 仅 spawn：新任务 id
+    now         事件处理后的逻辑时钟时刻
     """
     seq: int
     op: str
@@ -122,6 +145,7 @@ class Receipt:
     scope_state: Optional[str]
     pending: tuple[str, ...]
     new_task_id: Optional[int] = None
+    now: int = 0
 
 
 # ---------------------------------------------------------------- 校验
@@ -160,6 +184,10 @@ class TaskRuntime:
             0: _Task(id=0, parent=None, name="<root>", depth=0)}
         self._next_id = 1
         self._seq = 0
+        self._now = 0
+        # 定时条目堆：(deadline, task_id, generation)；task_id 即创建序。
+        # 失效条目（代次/时刻不匹配）惰性剔除，不原地删除。
+        self._timers: list[tuple[int, int, int]] = []
         self.log: list[Receipt] = []
 
     # ---------------------------------------------------------- 内部工具
@@ -200,7 +228,15 @@ class TaskRuntime:
                         and all(self._tasks[c].state == "exited"
                                 for c in t.children)):
                     t.scope_state = "closed"
+                    # scope 完成关闭后，其到期记录一并失效
+                    self._invalidate_deadline(t)
                     changed = True
+
+    def _invalidate_deadline(self, t: _Task) -> None:
+        """使 t 的到期记录失效；堆中旧条目成为垃圾，由代次检查惰性剔除。"""
+        if t.deadline is not None:
+            t.deadline = None
+            t.deadline_gen += 1
 
     def _request_cancel(self, node: _Task, notes: list[str]) -> None:
         if node.shield_depth > 0:
@@ -231,6 +267,7 @@ class TaskRuntime:
             scope_state=(t.scope_state if t is not None else None),
             pending=tuple(self.pending_reasons(0)),
             new_task_id=new_task_id,
+            now=self._now,
         )
         self.log.append(r)
         return r
@@ -306,6 +343,10 @@ class TaskRuntime:
             t.outcome_kind = "finished"
             t.outcome_value = result
             notes = [f"task#{t.id} finished with {result!r}"]
+        if t.deadline is not None:
+            notes.append(f"deadline of task#{t.id} (at {t.deadline}) "
+                         f"invalidated: outcome recorded")
+            self._invalidate_deadline(t)
         t.state = "draining"
         self._reap()
         return self._receipt("finish", t.id, notes)
@@ -339,6 +380,10 @@ class TaskRuntime:
         if t.cancel_delivered:
             notes.append("cancellation had been delivered; "
                          "business failure takes precedence")
+        if t.deadline is not None:
+            notes.append(f"deadline of task#{t.id} (at {t.deadline}) "
+                         f"invalidated: outcome recorded")
+            self._invalidate_deadline(t)
         t.state = "draining"
         self._reap()
         return self._receipt("fail", t.id, notes)
@@ -420,7 +465,117 @@ class TaskRuntime:
             notes.append(f"scope of task#{t.id} closed")
         return self._receipt("close_scope", t.id, notes)
 
+    # ------------------------------------------------- 事件：deadline 设置
+
+    def set_deadline(self, task_id: int, deadline: int) -> Receipt:
+        """给任务或 scope（含 root）设置/更新截止时刻。
+
+        子任务不复制父任务的截止时间；更新会使旧定时条目作废。
+        截止时刻不得小于当前逻辑时钟（过去时刻无意义，拒绝而非静默触发）。
+        """
+        t = self._get(task_id)
+        _require_int(deadline, "deadline")
+        if deadline < 0:
+            raise ValueError(f"deadline must be >= 0, got {deadline}")
+        if deadline < self._now:
+            raise ValueError(
+                f"deadline {deadline} is in the past (now={self._now})")
+        if t.id != 0 and t.outcome_kind is not None:
+            raise TaskStateError(
+                f"task#{t.id} already ended as {t.outcome_kind}; "
+                f"cannot set deadline")
+        if t.scope_state == "closed":
+            raise TaskStateError(
+                f"scope of task#{t.id} is closed; cannot set deadline")
+        old = t.deadline
+        t.deadline = deadline
+        t.deadline_gen += 1
+        heapq.heappush(self._timers, (deadline, t.id, t.deadline_gen))
+        if old is None:
+            notes = [f"deadline of task#{t.id} set to {deadline} "
+                     f"(now={self._now})"]
+        else:
+            notes = [f"deadline of task#{t.id} changed {old} -> {deadline}; "
+                     f"previous timer entry invalidated "
+                     f"(generation {t.deadline_gen})"]
+        return self._receipt("set_deadline", t.id, notes)
+
+    def clear_deadline(self, task_id: int) -> Receipt:
+        """清除截止时刻；幂等。堆中旧条目由代次检查惰性剔除。"""
+        t = self._get(task_id)
+        if t.deadline is None:
+            notes = [f"task#{t.id} has no deadline; "
+                     f"clear_deadline is idempotent"]
+        else:
+            old = t.deadline
+            self._invalidate_deadline(t)
+            notes = [f"deadline of task#{t.id} (at {old}) cleared; "
+                     f"timer entry invalidated"]
+        return self._receipt("clear_deadline", t.id, notes)
+
+    # ------------------------------------------------- 事件：advance_time
+
+    def advance_time(self, now: int) -> Receipt:
+        """把逻辑时钟推进到 now（非递减整数；相等允许，用于触发恰等到期）。
+
+        先按 (截止时刻, 任务创建序) 触发全部到期条目（deadline <= now，
+        恰好相等也算到期），再返回——调用方的下一条业务事件因此在所有
+        到期处理之后才被处理。到期只提出取消请求：shield 内记 pending，
+        scope 关闭仍走 close_scope 的既有等待条件。
+        """
+        _require_int(now, "now")
+        if now < self._now:
+            raise ValueError(
+                f"time is non-decreasing: cannot advance from {self._now} "
+                f"back to {now}")
+        if now == self._now:
+            notes = [f"time stays at {now}; checking for due deadlines"]
+        else:
+            notes = [f"time advanced {self._now} -> {now}"]
+        self._now = now
+        fired = 0
+        while self._timers and self._timers[0][0] <= now:
+            deadline, tid, gen = heapq.heappop(self._timers)
+            t = self._tasks[tid]
+            if t.deadline != deadline or t.deadline_gen != gen:
+                continue  # 旧代次/已失效的定时条目，不得影响当前任务
+            self._invalidate_deadline(t)
+            fired += 1
+            if t.id == 0:
+                notes.append(
+                    f"deadline of root scope expired at {deadline}: "
+                    f"requesting cancellation of all unfinished descendants")
+                self._cancel_nodes(self._subtree(0)[1:], notes)
+            else:
+                notes.append(
+                    f"deadline of task#{t.id} '{t.name}' expired at "
+                    f"{deadline}: cancellation requested for its subtree")
+                self._cancel_nodes(self._subtree(t.id), notes)
+        if not fired:
+            notes.append("no deadlines due")
+        self._reap()
+        return self._receipt("advance_time", 0, notes)
+
     # ---------------------------------------------------------- 查询
+
+    @property
+    def now(self) -> int:
+        """当前逻辑时钟时刻（非递减整数，初始 0）。"""
+        return self._now
+
+    def next_deadline(self) -> Optional[tuple[int, int]]:
+        """下一待触发时刻与到期来源：(deadline, task_id)；无则 None。
+
+        供模拟器逐步驱动：反复 advance_time(next_deadline()[0]) 即可按
+        (截止时刻, 创建序) 依次触发到期。失效条目在此惰性剔除。
+        """
+        while self._timers:
+            deadline, tid, gen = self._timers[0]
+            t = self._tasks[tid]
+            if t.deadline == deadline and t.deadline_gen == gen:
+                return (deadline, tid)
+            heapq.heappop(self._timers)
+        return None
 
     def status(self) -> dict[int, dict[str, Any]]:
         """整棵树快照（按任务创建序）。"""
@@ -439,6 +594,7 @@ class TaskRuntime:
                 "pending_cancels": t.pending_cancels,
                 "cancel_delivered": t.cancel_delivered,
                 "scope": t.scope_state,
+                "deadline": t.deadline,
                 "children": list(t.children),
             }
         return out
@@ -477,6 +633,11 @@ class TaskRuntime:
                     reasons.append(
                         f"scope of task#{n.id}: closing, waiting on "
                         f"child task(s) {open_children}")
+            if n.deadline is not None:
+                who = (f"task#{n.id} '{n.name}'" if n.id != 0
+                       else "root scope")
+                reasons.append(
+                    f"{who}: deadline at {n.deadline} (now={self._now})")
         return reasons
 
     def exception_group(self, task_id: int = 0) -> Optional[ExceptionGroup]:
