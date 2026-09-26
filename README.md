@@ -2,7 +2,7 @@
 
 离线、纯事件驱动的合成任务树库：不启线程、无事件循环，所有状态变化由
 显式有序的方法调用（事件）触发，每个事件返回包含状态与待完成原因的
-`Receipt`。
+`Receipt`。本版新增具名容量池，限制同时占用某种资源的子任务数量。
 
 ## 环境
 
@@ -14,6 +14,19 @@
 ```bash
 python -m unittest discover -s tests -v   # 单元测试 + 合法轨迹枚举验收
 python demo.py                            # 正常结果 + 异常组/等待链 + 拒绝边界
+```
+
+venv 准备（Python 3.14.7，无第三方依赖，无需 pip install）：
+
+```bash
+python3.14 -m venv .venv
+source .venv/bin/activate
+```
+
+容量池演示（现场计算，无 sleep，远小于 90 秒）：
+
+```bash
+python demo_iteration.py                 # FIFO 排队/取消归还/守恒核对/拒绝边界
 ```
 
 ## 模型
@@ -39,12 +52,28 @@ python demo.py                            # 正常结果 + 异常组/等待链 +
 | `pending_reasons(task_id=0) -> list[str]` | 子树待完成原因（等待链）；空列表 = 已完整退出 |
 | `exception_group(task_id=0) -> ExceptionGroup \| None` | 按任务创建序（父先于子）归并子树内全部业务异常；cancelled 不入组 |
 | `is_closed(task_id=0)` / `outcome(task_id)` | 查询辅助 |
+| `create_pool(name, capacity) -> Receipt` | 创建具名容量池；容量固定，无管理界面；重名抛 `PoolError` |
+| `acquire(task_id, pool, amount=1) -> Receipt` | 申请许可：空闲且队空立即授予，否则严格 FIFO 排队；`amount > capacity` 立即抛 `ResourceLimitError`，不入队 |
+| `release(task_id, pool, amount=None) -> Receipt` | 持有任务归还许可（默认全部）；归还后从队首起依次授予，队首不满足即停 |
+| `pool_status(pool=None) -> dict` | 池快照：`capacity`/`free`/`holders`/`queue` |
 
 取消与结局的优先级：
 
 - 取消已投递后 `finish` → 结局 `cancelled`（结果被取消取代）；
 - 取消已投递后 `fail(exc)` → 结局 `failed`（业务异常优先于取消）；
 - shield 内取消未投递时 `finish` → 正常 `finished`，离开时 pending 取消被丢弃。
+
+容量池语义：
+
+- 等待严格 FIFO：队首暂时拿不到时，后面的轻量请求不得插队。
+- 许可归持有任务所有，只能由持有者 `release`；任务记录结局
+  （finish/fail，含取消投递后的收尾与收尾抛错）时自动归还其全部许可，
+  且只归还一次（幂等 finish / 晚到 fail 不会重复释放）。
+- 还在排队的任务被取消投递（或记录结局）时立即移出队列，不会迟到获授；
+  父任务取消整棵子树时，每个后代的排队请求同样出队。
+- shield 只延迟取消交付：shield 内的排队任务暂不出队（甚至可能先获授），
+  最外层离开交付取消时才出队；已发出的释放不会因此重复执行。
+- 守恒不变量：任意事件后 `free + Σ holders == capacity`，演示逐步核对。
 
 ## 错误语义
 
@@ -55,7 +84,9 @@ python demo.py                            # 正常结果 + 异常组/等待链 +
     （取消不是业务异常，必须用 `cancel`/`close_scope` 表达）；
   - `UnknownTaskError`、`ScopeClosedError`、`FinishConflictError`、
     `ShieldError`（leave 多于 enter）、`TaskStateError`（如对 root 的
-    任务体操作）、`ResourceLimitError`（超上限）均为 `TaskTreeError` 子类。
+    任务体操作）、`ResourceLimitError`（超上限/超池容量）、`PoolError`
+    （池语义错误：重复创建、重复排队、无持有归还）、`UnknownPoolError`
+    （未知池名）均为 `TaskTreeError` 子类。
 - 每个操作要么完整生效、要么抛异常且不改状态；不存在未说明的部分变更。
 
 ## 输入上限
@@ -88,3 +119,7 @@ python demo.py                            # 正常结果 + 异常组/等待链 +
 - `finish` 幂等比较用 `==`，对自定义不可比值按冲突处理。
 - 结果值若为容器，其内部的 NaN 不做深检查（只校验顶层 float/complex）。
 - 不宣称兼容 Trio/asyncio 等任何现行标准的完整语义，仅实现本契约子集。
+- 不宣称兼容 Trio/asyncio 等任何现行标准的完整语义，仅实现本契约子集。
+- 容量池：同一任务在同一池只允许一个排队请求（重复排队抛 `PoolError`）；
+  已记录结局或已交付取消的任务不得再 `acquire`；池容量创建后固定，
+  不提供扩容/缩容或任何管理界面；池不随 scope 关闭而销毁。

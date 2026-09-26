@@ -1,4 +1,4 @@
-"""tasktree — 结构化任务树的取消与异常归并（合成、纯事件驱动、不启线程）。
+"""tasktree — 结构化任务树的取消、异常归并与具名容量池（纯事件驱动）。
 
 模型
 ----
@@ -26,11 +26,25 @@ scope: open --(close_scope)--> closing --(子任务全部退出)--> closed。
 --------
 exception_group(t) 按任务创建序（父先于子，id 即创建序）聚合子树内全部
 failed 任务的业务异常，返回 ExceptionGroup；无则返回 None。
+
+容量池
+------
+* create_pool(name, capacity) 创建具名容量池；容量创建后固定，无管理界面。
+* acquire(task_id, pool, amount) 申请许可：池空闲足够且队列为空时立即授予，
+  否则排入严格 FIFO 队列；队首暂时拿不到时，后面的轻量请求不得插队；
+  申请量超过池总容量立即拒绝（ResourceLimitError），不入队。
+* release(task_id, pool, amount=None) 显式归还；许可归持有任务所有，
+  只能由持有任务自己归还。
+* 任务记录结局（finish/fail，含取消投递后的收尾）时自动归还其全部许可，
+  且只归还一次；还在排队的任务被取消投递（或记录结局）时移出队列，
+  不会迟到获授。shield 只延迟取消交付，不造成重复释放。
+* 守恒不变量：任意事件后 sum(holders) + free == capacity。
 """
 
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -43,6 +57,7 @@ __all__ = [
     "TaskTreeError", "UnknownTaskError", "ScopeClosedError",
     "FinishConflictError", "ShieldError", "TaskStateError",
     "ResourceLimitError", "TaskCancelled",
+    "PoolError", "UnknownPoolError",
     "Receipt", "TaskRuntime",
 ]
 
@@ -81,6 +96,14 @@ class TaskCancelled(Exception):
     """取消标记：取消不是业务异常。fail() 拒绝该类的实例。"""
 
 
+class PoolError(TaskTreeError):
+    """容量池语义错误（重复创建、非法申请/归还等）的基类。"""
+
+
+class UnknownPoolError(PoolError, LookupError):
+    """引用了不存在的容量池名。"""
+
+
 # ---------------------------------------------------------------- 数据结构
 
 @dataclass
@@ -97,6 +120,18 @@ class _Task:
     pending_cancels: int = 0
     cancel_delivered: bool = False
     scope_state: str = "open"          # open | closing | closed
+
+
+@dataclass
+class _Pool:
+    name: str
+    capacity: int
+    holders: dict[int, int] = field(default_factory=dict)  # task_id -> 持有量
+    queue: deque = field(default_factory=deque)            # (task_id, amount)
+
+    @property
+    def free(self) -> int:
+        return self.capacity - sum(self.holders.values())
 
 
 @dataclass(frozen=True)
@@ -161,6 +196,7 @@ class TaskRuntime:
         self._next_id = 1
         self._seq = 0
         self.log: list[Receipt] = []
+        self._pools: dict[str, _Pool] = {}
 
     # ---------------------------------------------------------- 内部工具
 
@@ -213,6 +249,7 @@ class TaskRuntime:
         else:
             node.cancel_delivered = True
             notes.append(f"cancellation delivered to task#{node.id}")
+            self._dequeue_task(node.id, notes, "cancellation delivered")
 
     def _cancel_nodes(self, nodes: list[_Task], notes: list[str]) -> None:
         for n in nodes:
@@ -234,6 +271,63 @@ class TaskRuntime:
         )
         self.log.append(r)
         return r
+
+    # ---------------------------------------------------------- 容量池内部
+
+    def _get_pool(self, pool: Any) -> _Pool:
+        if not isinstance(pool, str):
+            raise TypeError(
+                f"pool must be a str, got {type(pool).__name__}: {pool!r}")
+        try:
+            return self._pools[pool]
+        except KeyError:
+            raise UnknownPoolError(f"unknown pool: {pool!r}") from None
+
+    @staticmethod
+    def _require_amount(amount: Any) -> int:
+        _require_int(amount, "amount")
+        if amount < 1:
+            raise ValueError(f"amount must be >= 1, got {amount}")
+        return amount
+
+    def _try_grant(self, p: _Pool, notes: list[str]) -> None:
+        """严格 FIFO：只从队首起依次授予；队首拿不到即停，不许插队。"""
+        while p.queue:
+            task_id, amount = p.queue[0]
+            if p.free < amount:
+                return
+            p.queue.popleft()
+            p.holders[task_id] = p.holders.get(task_id, 0) + amount
+            notes.append(
+                f"granted {amount} permit(s) of pool '{p.name}' to "
+                f"task#{task_id} from queue head (free now {p.free})")
+
+    def _dequeue_task(self, task_id: int, notes: list[str],
+                      reason: str) -> None:
+        """把任务从所有池的等待队列移除（取消投递/记录结局时调用）。"""
+        for p in self._pools.values():
+            kept = [(tid, amt) for tid, amt in p.queue if tid != task_id]
+            if len(kept) != len(p.queue):
+                p.queue = deque(kept)
+                notes.append(
+                    f"task#{task_id} removed from queue of pool '{p.name}' "
+                    f"({reason}); it can never be granted late")
+                self._try_grant(p, notes)
+
+    def _release_permits_on_outcome(self, task: _Task,
+                                    notes: list[str]) -> None:
+        """任务记录结局时归还其全部许可并移出所有等待队列。
+
+        只在 outcome_kind 从 None 迁移的唯一位置调用，因此只释放一次。
+        """
+        self._dequeue_task(task.id, notes, "outcome recorded")
+        for p in self._pools.values():
+            held = p.holders.pop(task.id, 0)
+            if held:
+                notes.append(
+                    f"auto-released {held} permit(s) of pool '{p.name}' "
+                    f"on exit of task#{task.id} (free now {p.free})")
+                self._try_grant(p, notes)
 
     # ---------------------------------------------------------- 事件：spawn
 
@@ -307,6 +401,7 @@ class TaskRuntime:
             t.outcome_value = result
             notes = [f"task#{t.id} finished with {result!r}"]
         t.state = "draining"
+        self._release_permits_on_outcome(t, notes)
         self._reap()
         return self._receipt("finish", t.id, notes)
 
@@ -340,6 +435,7 @@ class TaskRuntime:
             notes.append("cancellation had been delivered; "
                          "business failure takes precedence")
         t.state = "draining"
+        self._release_permits_on_outcome(t, notes)
         self._reap()
         return self._receipt("fail", t.id, notes)
 
@@ -392,6 +488,7 @@ class TaskRuntime:
                 notes.append(
                     f"outermost shield left; {count} pending "
                     f"cancellation(s) delivered to task#{t.id}")
+                self._dequeue_task(t.id, notes, "cancellation delivered")
             else:
                 notes.append(
                     f"outermost shield left; {count} pending "
@@ -421,6 +518,107 @@ class TaskRuntime:
         return self._receipt("close_scope", t.id, notes)
 
     # ---------------------------------------------------------- 查询
+    # ------------------------------------------------- 事件：容量池
+
+    def create_pool(self, name: str, capacity: int) -> Receipt:
+        """创建具名容量池；容量固定，本题不提供管理界面。"""
+        if not isinstance(name, str):
+            raise TypeError(
+                f"name must be a str, got {type(name).__name__}: {name!r}")
+        if not name:
+            raise ValueError("pool name must be non-empty")
+        if len(name) > MAX_NAME_LEN:
+            raise ValueError(
+                f"pool name length {len(name)} exceeds "
+                f"MAX_NAME_LEN={MAX_NAME_LEN}")
+        _require_int(capacity, "capacity")
+        if capacity < 1:
+            raise ValueError(f"capacity must be >= 1, got {capacity}")
+        if name in self._pools:
+            raise PoolError(f"pool {name!r} already exists")
+        self._pools[name] = _Pool(name=name, capacity=capacity)
+        return self._receipt(
+            "create_pool", None,
+            [f"created pool '{name}' with capacity {capacity}"])
+
+    def acquire(self, task_id: int, pool: str, amount: int = 1) -> Receipt:
+        """申请许可：立即授予或排入严格 FIFO 队列；超容量立即拒绝。"""
+        t = self._get(task_id)
+        p = self._get_pool(pool)
+        self._require_amount(amount)
+        if t.id == 0:
+            raise TaskStateError("root has no task body; cannot acquire")
+        if t.outcome_kind is not None:
+            raise TaskStateError(
+                f"task#{t.id} already ended as {t.outcome_kind}; "
+                f"cannot acquire")
+        if t.cancel_delivered:
+            raise TaskStateError(
+                f"cancellation already delivered to task#{t.id}; "
+                f"it must exit, not acquire")
+        if amount > p.capacity:
+            raise ResourceLimitError(
+                f"amount {amount} exceeds capacity {p.capacity} of pool "
+                f"'{p.name}'; rejected immediately, not queued")
+        if any(tid == t.id for tid, _ in p.queue):
+            raise PoolError(
+                f"task#{t.id} already has a queued request in pool "
+                f"'{p.name}'")
+        notes: list[str] = []
+        if not p.queue and p.free >= amount:
+            p.holders[t.id] = p.holders.get(t.id, 0) + amount
+            notes.append(
+                f"granted {amount} permit(s) of pool '{p.name}' to "
+                f"task#{t.id} immediately (free now {p.free})")
+        else:
+            p.queue.append((t.id, amount))
+            pos = len(p.queue)
+            notes.append(
+                f"task#{t.id} queued for {amount} permit(s) of pool "
+                f"'{p.name}' at position {pos} (strict FIFO, free "
+                f"{p.free})")
+        return self._receipt("acquire", t.id, notes)
+
+    def release(self, task_id: int, pool: str,
+                amount: Optional[int] = None) -> Receipt:
+        """持有任务显式归还许可；amount=None 表示归还在该池的全部持有。"""
+        t = self._get(task_id)
+        p = self._get_pool(pool)
+        held = p.holders.get(t.id, 0)
+        if held == 0:
+            raise PoolError(
+                f"task#{t.id} holds no permits of pool '{p.name}'; "
+                f"permits are owned by their holder and cannot be "
+                f"released twice")
+        if amount is None:
+            amount = held
+        self._require_amount(amount)
+        if amount > held:
+            raise ValueError(
+                f"task#{t.id} holds only {held} permit(s) of pool "
+                f"'{p.name}'; cannot release {amount}")
+        left = held - amount
+        if left:
+            p.holders[t.id] = left
+        else:
+            del p.holders[t.id]
+        notes = [f"task#{t.id} released {amount} permit(s) of pool "
+                 f"'{p.name}' (free now {p.free})"]
+        self._try_grant(p, notes)
+        return self._receipt("release", t.id, notes)
+
+    def pool_status(self, pool: Optional[str] = None) -> dict:
+        """池快照：capacity/free/holders/queue；pool=None 时返回全部池。"""
+        def snap(p: _Pool) -> dict:
+            return {
+                "capacity": p.capacity,
+                "free": p.free,
+                "holders": dict(sorted(p.holders.items())),
+                "queue": [(tid, amt) for tid, amt in p.queue],
+            }
+        if pool is not None:
+            return {pool: snap(self._get_pool(pool))}
+        return {name: snap(p) for name, p in self._pools.items()}
 
     def status(self) -> dict[int, dict[str, Any]]:
         """整棵树快照（按任务创建序）。"""
@@ -477,6 +675,13 @@ class TaskRuntime:
                     reasons.append(
                         f"scope of task#{n.id}: closing, waiting on "
                         f"child task(s) {open_children}")
+        subtree_ids = {n.id for n in self._subtree(t.id)}
+        for p in self._pools.values():
+            for pos, (tid, amt) in enumerate(p.queue, start=1):
+                if tid in subtree_ids:
+                    reasons.append(
+                        f"task#{tid}: queued for {amt} permit(s) of pool "
+                        f"'{p.name}' at position {pos}")
         return reasons
 
     def exception_group(self, task_id: int = 0) -> Optional[ExceptionGroup]:
