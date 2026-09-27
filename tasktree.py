@@ -1,4 +1,4 @@
-"""tasktree — 结构化任务树的取消与异常归并（合成、纯事件驱动、不启线程）。
+"""tasktree — 结构化任务树的取消、截止时间与异常归并（合成、纯事件驱动、不启线程）。
 
 模型
 ----
@@ -21,6 +21,22 @@ scope: open --(close_scope)--> closing --(子任务全部退出)--> closed。
 * 任务处于 shield（shield_depth > 0）时，取消只记为 pending；
   最外层 leave_shield（深度回到 0）时才投递。
 * 取消本身不是业务异常：cancelled 不进入 exception_group。
+
+截止时间与显式时钟
+------------------
+* 运行时持有一个逻辑时钟 now（构造时 now= 指定，默认 0）；时间只能由
+  调用方通过 advance_time(new_now) 显式、单调地推进。库内部不使用真实
+  等待，也不启动任何后台计时器/线程。
+* spawn(deadline=...) 给任务设截止时刻；子任务的期限不得越过父 scope
+  的期限（父有期限时，子必须给出不晚于父的期限）；根 scope 的期限由
+  构造参数 deadline= 指定。
+* advance_time 推进到 T 时，对所有 deadline <= T 且尚无结局的任务发起
+  取消（shield 内记 pending）；根期限到期 = 请求取消全部未结束后代。
+  到期取消同样只是请求：任务仍需 finish/fail 显式退出，不会被直接标成
+  完成。
+* 同一时刻的固定处理顺序：显式的 finish/fail 事件总是先于随后
+   advance_time 触发的到期扫描；同一次 advance 内多个任务到期时，按
+  任务创建序（id 序）依次投递取消。
 
 异常归并
 --------
@@ -89,6 +105,7 @@ class _Task:
     parent: Optional[int]
     name: str
     depth: int
+    deadline: Optional[float] = None
     children: list[int] = field(default_factory=list)
     state: str = "active"              # active | draining | exited
     outcome_kind: Optional[str] = None  # finished | failed | cancelled
@@ -96,6 +113,7 @@ class _Task:
     shield_depth: int = 0
     pending_cancels: int = 0
     cancel_delivered: bool = False
+    deadline_fired: bool = False
     scope_state: str = "open"          # open | closing | closed
 
 
@@ -142,25 +160,50 @@ def _check_result(value: Any) -> None:
         raise ValueError(f"result must be finite, got {value!r}")
 
 
+def _check_time(value: Any, name: str) -> float:
+    # 时刻/期限：拒绝 bool 与非有限数值；不做任何静默纠正。
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(
+            f"{name} must be an int or float, got "
+            f"{type(value).__name__}: {value!r}")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return float(value)
+
+
 # ---------------------------------------------------------------- 运行时
 
 class TaskRuntime:
     """一棵合成任务树。所有操作同步、有序、无线程。"""
 
-    def __init__(self, *, max_tasks: int = MAX_TASKS, max_depth: int = MAX_DEPTH):
+    def __init__(self, *, max_tasks: int = MAX_TASKS, max_depth: int = MAX_DEPTH,
+                 now: Any = 0, deadline: Any = None):
         _require_int(max_tasks, "max_tasks")
         _require_int(max_depth, "max_depth")
         if max_tasks < 1:
             raise ValueError(f"max_tasks must be >= 1, got {max_tasks}")
         if max_depth < 1:
             raise ValueError(f"max_depth must be >= 1, got {max_depth}")
+        start = _check_time(now, "now")
+        root_deadline = (None if deadline is None
+                         else _check_time(deadline, "deadline"))
+        if root_deadline is not None and root_deadline < start:
+            raise ValueError(
+                f"deadline {root_deadline} is earlier than now={start}")
         self.max_tasks = max_tasks
         self.max_depth = max_depth
+        self._now = start
         self._tasks: dict[int, _Task] = {
-            0: _Task(id=0, parent=None, name="<root>", depth=0)}
+            0: _Task(id=0, parent=None, name="<root>", depth=0,
+                     deadline=root_deadline)}
         self._next_id = 1
         self._seq = 0
         self.log: list[Receipt] = []
+
+    @property
+    def now(self) -> float:
+        """当前逻辑时刻；只能由 advance_time 推进。"""
+        return self._now
 
     # ---------------------------------------------------------- 内部工具
 
@@ -237,7 +280,8 @@ class TaskRuntime:
 
     # ---------------------------------------------------------- 事件：spawn
 
-    def spawn(self, parent: int = 0, name: Optional[str] = None) -> Receipt:
+    def spawn(self, parent: int = 0, name: Optional[str] = None,
+              deadline: Any = None) -> Receipt:
         p = self._get(parent)
         if p.scope_state != "open":
             raise ScopeClosedError(
@@ -255,6 +299,23 @@ class TaskRuntime:
         elif len(name) > MAX_NAME_LEN:
             raise ValueError(
                 f"name length {len(name)} exceeds MAX_NAME_LEN={MAX_NAME_LEN}")
+        child_deadline = (None if deadline is None
+                          else _check_time(deadline, "deadline"))
+        if child_deadline is not None and child_deadline < self._now:
+            raise ValueError(
+                f"deadline {child_deadline} is earlier than "
+                f"now={self._now}")
+        if p.deadline is not None:
+            # 子任务期限不得越过父 scope 的期限。
+            if child_deadline is None:
+                raise ValueError(
+                    f"parent task#{p.id} has deadline {p.deadline}; "
+                    f"child deadline must be set and <= parent deadline, "
+                    f"got None")
+            if child_deadline > p.deadline:
+                raise ValueError(
+                    f"child deadline {child_deadline} exceeds parent "
+                    f"task#{p.id} deadline {p.deadline}")
         if len(self._tasks) >= self.max_tasks:
             raise ResourceLimitError(
                 f"task limit reached: max_tasks={self.max_tasks}")
@@ -264,12 +325,52 @@ class TaskRuntime:
                 f"depth limit exceeded: max_depth={self.max_depth}")
         tid = self._next_id
         self._next_id += 1
-        self._tasks[tid] = _Task(id=tid, parent=p.id, name=name, depth=depth)
+        self._tasks[tid] = _Task(id=tid, parent=p.id, name=name, depth=depth,
+                                 deadline=child_deadline)
         p.children.append(tid)
-        return self._receipt(
-            "spawn", tid,
-            [f"spawned task#{tid} '{name}' under task#{p.id}"],
-            new_task_id=tid)
+        notes = [f"spawned task#{tid} '{name}' under task#{p.id}"]
+        if child_deadline is not None:
+            notes.append(f"deadline set at {child_deadline}")
+        return self._receipt("spawn", tid, notes, new_task_id=tid)
+
+    # ------------------------------------------------- 事件：advance_time
+
+    def advance_time(self, new_now: Any) -> Receipt:
+        """显式推进逻辑时钟；对到期且未完成的任务发起取消（仅请求）。
+
+        固定处理顺序：调用方在当前时刻发出的 finish/fail 事件总是先于
+        本方法触发的到期扫描；同一次推进内多个任务到期时按任务创建序
+        （id 序）依次投递取消。取消不确认退出，任务仍需 finish/fail。
+        """
+        target = _check_time(new_now, "new_now")
+        if target < self._now:
+            raise ValueError(
+                f"new_now {target} is earlier than current now={self._now}; "
+                f"time is caller-driven and monotonic")
+        self._now = target
+        notes: list[str] = [f"time advanced to {target}"]
+        # 按创建序扫描到期任务；每个期限只触发一次。
+        for t in sorted(self._tasks.values(), key=lambda n: n.id):
+            if t.deadline is None or t.deadline_fired:
+                continue
+            if t.deadline > target:
+                continue
+            t.deadline_fired = True
+            if t.id == 0:
+                notes.append(
+                    f"root scope deadline {t.deadline} reached: requesting "
+                    f"cancellation of all unfinished descendants")
+                self._cancel_nodes(self._subtree(0)[1:], notes)
+            elif t.outcome_kind is not None:
+                notes.append(
+                    f"task#{t.id} deadline {t.deadline} reached but task "
+                    f"already ended as {t.outcome_kind}; no cancellation")
+            else:
+                notes.append(
+                    f"task#{t.id} deadline {t.deadline} reached")
+                self._request_cancel(t, notes)
+        self._reap()
+        return self._receipt("advance_time", None, notes)
 
     # ---------------------------------------------------------- 事件：finish
 
@@ -438,6 +539,8 @@ class TaskRuntime:
                 "shield_depth": t.shield_depth,
                 "pending_cancels": t.pending_cancels,
                 "cancel_delivered": t.cancel_delivered,
+                "deadline": t.deadline,
+                "deadline_fired": t.deadline_fired,
                 "scope": t.scope_state,
                 "children": list(t.children),
             }

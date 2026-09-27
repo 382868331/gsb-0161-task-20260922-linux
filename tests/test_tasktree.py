@@ -366,5 +366,144 @@ class EnumerationTest(unittest.TestCase):
         self.assertGreater(stats["closed_trees"], 0)
 
 
+class DeadlineTest(unittest.TestCase):
+    """显式时钟与截止时间：到期发起取消（仅请求），顺序固定。"""
+
+    def test_expiry_requests_cancel_but_does_not_complete(self):
+        rt = TaskRuntime()
+        rt.spawn(0, "a", deadline=10)
+        r = rt.advance_time(10)
+        st = rt.status()
+        # 取消已投递，但任务未确认退出前仍是 active，不是完成
+        self.assertTrue(st[1]["cancel_delivered"], st)
+        self.assertTrue(st[1]["deadline_fired"], st)
+        self.assertEqual(st[1]["state"], "active", st)
+        self.assertIsNone(st[1]["outcome"], st)
+        self.assertTrue(any("awaiting exit" in p
+                            for p in rt.pending_reasons(0)))
+        # 到期后 finish -> cancelled（取消取代结果）
+        rt.finish(1, "too-late")
+        self.assertEqual(rt.outcome(1)[0], "cancelled")
+        self.assertIsNone(rt.exception_group(0))
+
+    def test_expiry_not_reached_before_deadline(self):
+        rt = TaskRuntime()
+        rt.spawn(0, "a", deadline=10)
+        rt.advance_time(9)
+        st = rt.status()
+        self.assertFalse(st[1]["cancel_delivered"], st)
+        rt.finish(1, "ok")
+        self.assertEqual(rt.outcome(1), ("finished", "ok"))
+
+    def test_completion_before_expiry_at_same_instant_wins(self):
+        # 固定顺序：同一时刻，显式 finish 先于随后 advance 的到期扫描
+        rt = TaskRuntime(now=5)
+        rt.spawn(0, "a", deadline=10)
+        rt.advance_time(10)
+        rt2 = TaskRuntime(now=5)
+        rt2.spawn(0, "a", deadline=10)
+        rt2.finish(1, "done")          # now=5 时完成
+        rt2.advance_time(10)           # 随后推进到期限
+        self.assertEqual(rt2.outcome(1), ("finished", "done"))
+        self.assertFalse(rt2.status()[1]["cancel_delivered"])
+        # 反向顺序：先推进到到期，再 finish -> cancelled
+        self.assertEqual(rt.outcome(1)[0], None)
+        rt.finish(1, "done")
+        self.assertEqual(rt.outcome(1)[0], "cancelled")
+
+    def test_multiple_expiries_processed_in_creation_order(self):
+        rt = TaskRuntime()
+        rt.spawn(0, "a", deadline=5)
+        rt.spawn(0, "b", deadline=5)
+        rt.spawn(0, "c", deadline=7)
+        r = rt.advance_time(7)
+        fired = [n for n in r.notes if "deadline" in n and "reached" in n]
+        self.assertEqual(len(fired), 3, r.notes)
+        self.assertIn("task#1", fired[0])
+        self.assertIn("task#2", fired[1])
+        self.assertIn("task#3", fired[2])
+        st = rt.status()
+        for tid in (1, 2, 3):
+            self.assertTrue(st[tid]["cancel_delivered"], st)
+
+    def test_child_deadline_must_not_exceed_parent(self):
+        rt = TaskRuntime()
+        rt.spawn(0, "p", deadline=10)
+        rt.spawn(1, "early", deadline=3)          # 更早：允许
+        with self.assertRaises(ValueError):
+            rt.spawn(1, "late", deadline=11)      # 越过父期限：拒绝
+        with self.assertRaises(ValueError):
+            rt.spawn(1, "none")                   # 父有期限时子必须设期限
+        rt.spawn(1, "equal", deadline=10)         # 等于父期限：允许
+        # 父无期限时子自由
+        rt2 = TaskRuntime()
+        rt2.spawn(0, "free")
+        rt2.spawn(1, "any", deadline=99)
+
+    def test_root_deadline_cancels_all_unfinished(self):
+        rt = TaskRuntime(deadline=8)
+        rt.spawn(0, "a", deadline=8)
+        rt.spawn(0, "b", deadline=8)
+        rt.spawn(1, "a1", deadline=8)
+        rt.advance_time(8)
+        st = rt.status()
+        for tid in (1, 2, 3):
+            self.assertTrue(st[tid]["cancel_delivered"], st)
+            self.assertEqual(st[tid]["state"], "active", st)
+        with self.assertRaises(ValueError):
+            TaskRuntime(now=5, deadline=3)        # 期限早于当前时刻
+
+    def test_shielded_expiry_stays_pending_until_unshield(self):
+        rt = TaskRuntime()
+        rt.spawn(0, "a", deadline=5)
+        rt.enter_shield(1)
+        rt.advance_time(5)
+        st = rt.status()
+        self.assertFalse(st[1]["cancel_delivered"], st)
+        self.assertEqual(st[1]["pending_cancels"], 1, st)
+        rt.leave_shield(1)
+        self.assertTrue(rt.status()[1]["cancel_delivered"])
+
+    def test_deadline_fires_only_once(self):
+        rt = TaskRuntime()
+        rt.spawn(0, "a", deadline=5)
+        rt.advance_time(5)
+        r = rt.advance_time(9)
+        self.assertFalse(any("task#1" in n and "reached" in n
+                             for n in r.notes), r.notes)
+
+    def test_expiry_cancel_then_fail_keeps_exception_group(self):
+        rt = TaskRuntime()
+        rt.spawn(0, "a", deadline=5)
+        rt.spawn(0, "b")
+        rt.advance_time(5)                        # a 到期被取消
+        rt.fail(1, ValueError("boom"))            # 业务异常优先于取消
+        rt.finish(2, "ok")
+        eg = rt.exception_group(0)
+        self.assertIsNotNone(eg)
+        self.assertEqual(len(eg.exceptions), 1)
+        self.assertIsInstance(eg.exceptions[0], ValueError)
+        self.assertEqual(rt.outcome(1)[0], "failed")
+
+    def test_advance_time_validation(self):
+        rt = TaskRuntime()
+        with self.assertRaises(TypeError):
+            rt.advance_time(True)
+        with self.assertRaises(ValueError):
+            rt.advance_time(float("nan"))
+        with self.assertRaises(ValueError):
+            rt.advance_time(float("inf"))
+        rt.advance_time(5)
+        with self.assertRaises(ValueError):
+            rt.advance_time(4)                    # 时间不可倒退
+        self.assertEqual(rt.now, 5.0)
+        with self.assertRaises(TypeError):
+            rt.spawn(0, "x", deadline=True)
+        with self.assertRaises(ValueError):
+            rt.spawn(0, "x", deadline=float("nan"))
+        with self.assertRaises(ValueError):
+            rt.spawn(0, "x", deadline=4)          # 期限早于当前时刻
+
+
 if __name__ == "__main__":
     unittest.main()

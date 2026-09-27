@@ -112,9 +112,49 @@ def part3_rejection_boundary():
         print(f"  [拒绝] 冲突 finish -> {type(e).__name__}: {e}")
 
 
+def part4_deadlines():
+    print()
+    print("=" * 64)
+    print("第 4 部分：截止时间 —— 显式推进时钟，到期发起取消（仅请求）")
+    print("=" * 64)
+    rt = TaskRuntime(deadline=30)                 # 根 scope 期限 30
+    show(rt.spawn(0, "fast", deadline=10))
+    show(rt.spawn(0, "slow", deadline=20))
+    show(rt.spawn(2, "slow-helper", deadline=20))
+    show(rt.advance_time(10))                     # fast 到期
+    show(rt.finish(1, "partial"))                 # 取消已投递 -> cancelled
+    show(rt.advance_time(20))                     # slow 与其子到期
+    show_pending(rt)
+    # 到期取消只是请求：任务仍需显式退出，不会被直接标成完成
+    show(rt.fail(2, TimeoutError("slow missed its deadline")))
+    show(rt.finish(3, "helper stopped"))
+    show(rt.close_scope(0))
+    eg = rt.exception_group(0)
+    print(f"  异常组: {eg!r}")
+    print(f"  fast 结局: {rt.outcome(1)[0]}（取消取代迟到结果）")
+    # 同一时刻的固定顺序：显式 finish 先于随后 advance 的到期扫描
+    rt2 = TaskRuntime()
+    rt2.spawn(0, "edge", deadline=5)
+    rt2.finish(1, "in-time")                      # now=0 时先完成
+    rt2.advance_time(5)                           # 随后才推进到期限
+    print(f"  同时刻完成优先: edge 结局 = {rt2.outcome(1)}")
+    # 实际触发的拒绝：子期限越过父期限
+    rt2.spawn(0, "parent", deadline=10)
+    try:
+        rt2.spawn(2, "bad", deadline=99)
+    except ValueError as e:
+        print(f"  [拒绝] 子期限越过父期限 -> ValueError: {e}")
+    # 实际触发的拒绝：时间倒退
+    try:
+        rt2.advance_time(4)
+    except ValueError as e:
+        print(f"  [拒绝] 时间倒退 -> ValueError: {e}")
+
+
 if __name__ == "__main__":
     part1_normal()
     part2_group_and_waiting_chain()
     part3_rejection_boundary()
+    part4_deadlines()
     print()
     print("demo 完成：以上为真实计算结果，无预录、无 sleep。")
