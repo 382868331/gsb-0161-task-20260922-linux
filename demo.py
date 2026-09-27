@@ -4,6 +4,7 @@
 """
 
 from tasktree import (
+    DeadlineError,
     ScopeClosedError,
     TaskRuntime,
 )
@@ -112,9 +113,38 @@ def part3_rejection_boundary():
         print(f"  [拒绝] 冲突 finish -> {type(e).__name__}: {e}")
 
 
+def part4_deadlines():
+    print()
+    print("=" * 64)
+    print("第 4 部分：显式时钟与截止时间（无真实等待、无后台计时）")
+    print("=" * 64)
+    rt = TaskRuntime(deadline=10)            # 根 scope 期限 t=10
+    show(rt.spawn(0, "fast", deadline=5))   # 子任务更早的期限
+    show(rt.spawn(0, "slow"))               # 缺省继承父期限 t=10
+    show(rt.finish(1, "fast result"))       # t<5 完成
+    show(rt.advance(5))                      # fast 已完成：到期不覆盖完成
+    show(rt.advance(10))                     # slow 到期：仅请求取消
+    show_pending(rt)
+    # 取消只是请求：slow 显式退出，结局为 cancelled，不入异常组
+    show(rt.fail(2, TimeoutError("slow timed out after deadline")))
+    show_pending(rt)
+    print(f"  当前逻辑时刻: t={rt.now()}")
+    print(f"  fast 结局: {rt.outcome(1)[0]} / slow 结局: {rt.outcome(2)[0]}")
+    group = rt.exception_group(0)
+    print(f"  异常组: {group!r}")
+
+    # 拒绝边界：子期限越过父作用域期限
+    try:
+        rt2 = TaskRuntime(deadline=3)
+        rt2.spawn(0, "overreach", deadline=9)
+    except DeadlineError as e:
+        print(f"  [拒绝] 子期限越过父期限 -> DeadlineError: {e}")
+
+
 if __name__ == "__main__":
     part1_normal()
     part2_group_and_waiting_chain()
     part3_rejection_boundary()
+    part4_deadlines()
     print()
     print("demo 完成：以上为真实计算结果，无预录、无 sleep。")

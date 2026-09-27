@@ -22,6 +22,19 @@ scope: open --(close_scope)--> closing --(子任务全部退出)--> closed。
   最外层 leave_shield（深度回到 0）时才投递。
 * 取消本身不是业务异常：cancelled 不进入 exception_group。
 
+时间与截止时间
+--------------
+* 运行时只有显式逻辑时钟：now() 读取当前时刻，advance(t) 单调推进；
+  不使用真实等待，也没有任何后台计时。
+* 每个 scope（含根 scope）都可有一个 deadline；spawn(deadline=) 指定，
+  缺省继承父作用域期限。子任务可以更早，但不得晚于父作用域期限。
+* advance(T) 时，deadline <= T 且尚未触发的期限按 (deadline, 创建 id)
+  固定顺序触发，对仍未结束的子树发起取消请求（同样尊重 shield）。
+  取消只是请求：任务仍须 finish/fail 显式退出，绝不直接标记完成。
+* 完成与到期同一时刻的固定顺序：若任务在 advance 之前已显式记录结局，
+  则同一时刻的到期取消不覆盖该结局（完成优先于到期）；未记录结局者
+  才在本次 advance 收到取消请求。
+
 异常归并
 --------
 exception_group(t) 按任务创建序（父先于子，id 即创建序）聚合子树内全部
@@ -42,7 +55,7 @@ __all__ = [
     "MAX_TASKS", "MAX_DEPTH", "MAX_NAME_LEN",
     "TaskTreeError", "UnknownTaskError", "ScopeClosedError",
     "FinishConflictError", "ShieldError", "TaskStateError",
-    "ResourceLimitError", "TaskCancelled",
+    "ResourceLimitError", "DeadlineError", "TaskCancelled",
     "Receipt", "TaskRuntime",
 ]
 
@@ -77,6 +90,10 @@ class ResourceLimitError(TaskTreeError):
     """超出任务数/深度等接口上限。"""
 
 
+class DeadlineError(TaskTreeError):
+    """截止时间非法：越过父作用域期限、落在过去等。"""
+
+
 class TaskCancelled(Exception):
     """取消标记：取消不是业务异常。fail() 拒绝该类的实例。"""
 
@@ -97,6 +114,8 @@ class _Task:
     pending_cancels: int = 0
     cancel_delivered: bool = False
     scope_state: str = "open"          # open | closing | closed
+    deadline: Optional[int] = None
+    deadline_fired: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,19 +164,34 @@ def _check_result(value: Any) -> None:
 # ---------------------------------------------------------------- 运行时
 
 class TaskRuntime:
-    """一棵合成任务树。所有操作同步、有序、无线程。"""
+    """一棵合成任务树。所有操作同步、有序、无线程。
 
-    def __init__(self, *, max_tasks: int = MAX_TASKS, max_depth: int = MAX_DEPTH):
+    now= 为逻辑时钟起点（必须是非负整数）；deadline= 可选地指定根
+    scope 的截止时刻。时间只能通过 advance() 显式推进。
+    """
+
+    def __init__(self, *, max_tasks: int = MAX_TASKS, max_depth: int = MAX_DEPTH,
+                 now: int = 0, deadline: Optional[int] = None):
         _require_int(max_tasks, "max_tasks")
         _require_int(max_depth, "max_depth")
         if max_tasks < 1:
             raise ValueError(f"max_tasks must be >= 1, got {max_tasks}")
         if max_depth < 1:
             raise ValueError(f"max_depth must be >= 1, got {max_depth}")
+        _require_int(now, "now")
+        if now < 0:
+            raise ValueError(f"now must be >= 0, got {now}")
+        if deadline is not None:
+            _require_int(deadline, "deadline")
+            if deadline < now:
+                raise DeadlineError(
+                    f"root deadline {deadline} is in the past (now={now})")
         self.max_tasks = max_tasks
         self.max_depth = max_depth
+        self._now = now
         self._tasks: dict[int, _Task] = {
-            0: _Task(id=0, parent=None, name="<root>", depth=0)}
+            0: _Task(id=0, parent=None, name="<root>", depth=0,
+                     deadline=deadline)}
         self._next_id = 1
         self._seq = 0
         self.log: list[Receipt] = []
@@ -220,6 +254,28 @@ class TaskRuntime:
                 continue  # 已有结局的任务不再接受取消
             self._request_cancel(n, notes)
 
+    def _fire_due_deadlines(self, notes: list[str]) -> None:
+        """按 (deadline, id) 的固定顺序触发所有到期 scope。
+
+        对每个到期 scope：标记已触发，并对其仍未记录结局的整棵子树
+        发起取消请求（尊重 shield）。取消只是请求，不改动任务结局。
+        """
+        due = sorted(
+            (t for t in self._tasks.values()
+             if t.deadline is not None and not t.deadline_fired
+             and t.deadline <= self._now),
+            key=lambda t: (t.deadline, t.id))
+        for t in due:
+            t.deadline_fired = True
+            targets = [n for n in self._subtree(t.id)
+                       if n.outcome_kind is None
+                       and not (t.id == 0 and n.id == 0)]
+            notes.append(
+                f"deadline reached at t={self._now} for scope of "
+                f"task#{t.id} (deadline={t.deadline}); requesting "
+                f"cancellation of {len(targets)} unfinished task(s)")
+            self._cancel_nodes(targets, notes)
+
     def _receipt(self, op: str, task_id: Optional[int],
                  notes: list[str], new_task_id: Optional[int] = None) -> Receipt:
         self._seq += 1
@@ -237,7 +293,8 @@ class TaskRuntime:
 
     # ---------------------------------------------------------- 事件：spawn
 
-    def spawn(self, parent: int = 0, name: Optional[str] = None) -> Receipt:
+    def spawn(self, parent: int = 0, name: Optional[str] = None,
+              *, deadline: Optional[int] = None) -> Receipt:
         p = self._get(parent)
         if p.scope_state != "open":
             raise ScopeClosedError(
@@ -247,6 +304,18 @@ class TaskRuntime:
             raise ScopeClosedError(
                 f"task#{p.id} already recorded outcome "
                 f"({p.outcome_kind}); its scope no longer accepts spawn")
+        if deadline is not None:
+            _require_int(deadline, "deadline")
+            if deadline < self._now:
+                raise DeadlineError(
+                    f"deadline {deadline} is in the past (now={self._now})")
+        # 子任务期限可以更早，但不得越过父作用域期限（缺省则继承）。
+        eff_deadline = p.deadline if deadline is None else deadline
+        if deadline is not None and p.deadline is not None \
+                and deadline > p.deadline:
+            raise DeadlineError(
+                f"deadline {deadline} for child of task#{p.id} must not be "
+                f"later than parent scope deadline {p.deadline}")
         if name is None:
             name = f"task-{self._next_id}"
         elif not isinstance(name, str):
@@ -264,11 +333,17 @@ class TaskRuntime:
                 f"depth limit exceeded: max_depth={self.max_depth}")
         tid = self._next_id
         self._next_id += 1
-        self._tasks[tid] = _Task(id=tid, parent=p.id, name=name, depth=depth)
+        self._tasks[tid] = _Task(id=tid, parent=p.id, name=name, depth=depth,
+                                 deadline=eff_deadline)
         p.children.append(tid)
+        notes = [f"spawned task#{tid} '{name}' under task#{p.id}",
+                 f"task#{tid} effective deadline={eff_deadline}"]
+        # spawn 时新 scope 恰好已到期：固定顺序触发（仍在本事件内）。
+        if eff_deadline is not None and eff_deadline <= self._now:
+            self._fire_due_deadlines(notes)
+        self._reap()
         return self._receipt(
-            "spawn", tid,
-            [f"spawned task#{tid} '{name}' under task#{p.id}"],
+            "spawn", tid, notes,
             new_task_id=tid)
 
     # ---------------------------------------------------------- 事件：finish
@@ -402,6 +477,38 @@ class TaskRuntime:
 
     # ------------------------------------------------- 事件：close_scope
 
+    # ------------------------------------------------- 事件：显式时钟
+
+    def now(self) -> int:
+        """当前逻辑时刻（初始为构造时的 now，默认 0）。"""
+        return self._now
+
+    def deadline_of(self, task_id: int) -> Optional[int]:
+        """查询 scope 的截止时刻；无期限返回 None。"""
+        return self._get(task_id).deadline
+
+    def advance(self, to_time: int) -> Receipt:
+        """把逻辑时钟显式推进到 to_time（单调、只增不减）。
+
+        不做真实等待、不启动任何后台计时：到点的 scope 截止时间在本调用
+        内按 (deadline, 创建 id) 的固定顺序触发，对尚未记录结局的任务
+        发起取消请求。完成与到期同一时刻时，已在推进前显式记录结局的
+        任务优先（不再被到期取消覆盖）；取消仅为请求，未退出的任务
+        不会被直接标记完成。
+        """
+        _require_int(to_time, "to_time")
+        if to_time < self._now:
+            raise DeadlineError(
+                f"clock cannot move backwards: now={self._now}, "
+                f"requested {to_time}")
+        notes: list[str] = [f"clock advanced t={self._now} -> t={to_time}"]
+        self._now = to_time
+        self._fire_due_deadlines(notes)
+        self._reap()
+        return self._receipt("advance", 0, notes)
+
+    # ------------------------------------------------- 事件：close_scope
+
     def close_scope(self, task_id: int) -> Receipt:
         t = self._get(task_id)
         if t.scope_state != "open":
@@ -438,6 +545,8 @@ class TaskRuntime:
                 "shield_depth": t.shield_depth,
                 "pending_cancels": t.pending_cancels,
                 "cancel_delivered": t.cancel_delivered,
+                "deadline": t.deadline,
+                "deadline_fired": t.deadline_fired,
                 "scope": t.scope_state,
                 "children": list(t.children),
             }
@@ -460,8 +569,13 @@ class TaskRuntime:
                             f"(depth {n.shield_depth}) with "
                             f"{n.pending_cancels} pending cancellation(s)")
                     else:
-                        reasons.append(
-                            f"task#{n.id} '{n.name}': active")
+                        if n.deadline is not None:
+                            reasons.append(
+                                f"task#{n.id} '{n.name}': active "
+                                f"(deadline={n.deadline})")
+                        else:
+                            reasons.append(
+                                f"task#{n.id} '{n.name}': active")
                 elif n.state != "exited":
                     waiting = sum(
                         1 for d in self._subtree(n.id)[1:]
@@ -477,6 +591,14 @@ class TaskRuntime:
                     reasons.append(
                         f"scope of task#{n.id}: closing, waiting on "
                         f"child task(s) {open_children}")
+            if (n.scope_state == "open" and n.deadline is not None
+                    and n.deadline_fired
+                    and any(self._tasks[c].state != "exited"
+                            for c in n.children)):
+                reasons.append(
+                    f"scope of task#{n.id}: deadline {n.deadline} fired at "
+                    f"t={self._now}, cancellation requested, waiting on "
+                    f"child task(s) to exit")
         return reasons
 
     def exception_group(self, task_id: int = 0) -> Optional[ExceptionGroup]:
